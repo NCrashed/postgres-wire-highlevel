@@ -14,8 +14,10 @@ module Database.PostgreSQL.Encoder(
 
 import Control.Monad
 import Control.Monad.ST.Strict
+import Data.Functor.Identity
 import Data.Int
 import Data.Map (Map)
+import Data.Maybe
 import Data.Monoid
 import Data.Proxy
 import Data.Store (poke)
@@ -23,6 +25,9 @@ import Data.Store.Core
 import Data.Vector (Vector)
 import Data.Word
 import Database.PostgreSQL.Protocol.Types
+import qualified Data.Array.Repa as R
+import qualified Data.Array.Repa.Eval as R
+import qualified Data.Array.Repa.Repr.Vector as R
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.Foldable as F
@@ -38,30 +43,18 @@ type CompositeName = T.Text
 -- | Encoder structure that holds all info, how to encode a type for binary protocol
 -- of postgresql.
 data Encoder =
-    -- | Primitive encoder with known oid, oid of array and size.
+    -- | Primitive encoder that can be used as array element.
       Encoder'Primitive !EncoderPrimitive
     -- | Encoder of array of given element
     | Encoder'Array !EncoderArray
-    -- | Encoder of composites with statically known names
-    | Encoder'Composite !EncoderComposite
 
--- QUESTION: Is composite actually a primitive subtype?
-
--- | Holds info how to serialise primitive PostgreSQL value
+-- | Holds info how to serialise primitive PostgreSQL value. The struct covers
+-- native types, user defined base types and composites.
 data EncoderPrimitive = EncoderPrimitive {
     -- | OID of type
-    encoderPrimOid    :: !Oid
-    -- | OID of array of the type
-  , encoderPrimArrOid :: !Oid
+    encoderPrimOids   :: !(Either CompositeName (Oid, Oid))
     -- | Either a Null 'Nothing' or poker with size of required buffer
-  , encoderPrimPoke   :: !(Maybe PE.Encode)
-  }
-  -- | Holds info how to serialise user defined primitive types for PostgreSQL
-  | EncoderBase {
-    -- | Name of base type
-    encoderBaseName   :: !CompositeName
-    -- | Either a Null 'Nothing' or poker with size of required buffer
-  , encoderBasePoke   :: !(Maybe PE.Encode)
+  , encoderPrimPoke   :: !(Maybe (Either [Encoder] PE.Encode))
   }
 
 -- | Holds info how to serialise PostgreSQL arrays
@@ -70,19 +63,13 @@ data EncoderArray = EncoderArray {
       encoderArrayElem    :: !(Either CompositeName (Oid, Oid))
     -- | Dimensions of array
     , encoderArrayDims    :: !(Vector ArrayDimension)
-    -- | Poker for contents of the array with size of required buffer
-    --
-    -- Important note: that each element of the payload should be length tagged.
-    -- First goes word32 length in bytes of element contents, next the rest
-    -- payload of element is continued.
-    , encoderArrayPayload :: !PE.Encode
+    -- | Serialised elements of array
+    , encoderArrayPayload :: !(Vector EncoderPrimitive)
     }
   -- | Special case for NULL array
   | EncoderNullArray {
       -- | Encoder for element (we need oids or name from the field)
       encoderNullArrayElem  :: !(Either CompositeName (Oid, Oid))
-      -- | Number of dimensions
-    , encoderNullArrayDims  :: !Word32
     }
 
 -- | Specification of array dimension
@@ -91,14 +78,6 @@ data ArrayDimension = ArrayDimension {
     arrayElements :: Word32
   -- | Start index of the dimension. Almost always 1.
   , arrayDimStart :: Word32
-  }
-
--- | Holds info how to serialise PostgreSQL composite type
-data EncoderComposite = EncoderComposite {
-    -- | Statically known name of composite type
-    encoderCompositeName   :: !CompositeName
-    -- | If 'Nothing' the composite is NULL, else holds encoded fields
-  , encoderCompositeFields :: !(Maybe [Encoder])
   }
 
 -- | Speical map that stores mapping from type name to oid
@@ -118,13 +97,36 @@ runEncoder oidsMap e = do
   (oid, mpoker) <- pokeEncoder oidsMap e
   return (oid, PE.runEncode <$> mpoker)
 
--- | Helper that constructs poke encoder with needed buffer size
-pokeEncoder :: OidsMap -> Encoder -> Either CompositeName (Oid, Maybe PE.Encode)
-pokeEncoder oidsMap e = case e of
-  Encoder'Primitive (EncoderPrimitive oid _ mpoker) -> Right (oid, mpoker)
-  Encoder'Primitive (EncoderBase name mpoker) -> (, mpoker) <$> elookup name (oidsPlain oidsMap)
-  Encoder'Array EncoderArray{..} -> do
+-- | Helper that constructs poke encoder for primitives with required buffer size
+pokePrimitive :: OidsMap -> EncoderPrimitive -> Either CompositeName (Oid, Maybe PE.Encode)
+pokePrimitive oidsMap e = case e of
+  EncoderPrimitive oids Nothing -> do
+    (oid, _) <- resolveOids oidsMap oids
+    return (oid, Nothing)
+  EncoderPrimitive oids (Just (Right mpoker)) -> do
+    (oid, _) <- resolveOids oidsMap oids
+    return (oid, Just mpoker)
+  EncoderPrimitive oids (Just (Left fields)) -> do
+    (oid, _) <- resolveOids oidsMap oids
+    fieldsPokers <- traverse (pokeEncoder oidsMap) fields
+    let fieldPoker (eoid, Nothing) =
+             PE.putInt32BE (unOid eoid)
+          <> PE.putInt32BE (-1)
+        fieldPoke (eoid, Just (epoke, n)) =
+             PE.putInt32BE (unOid eoid)
+          <> PE.putWord32BE (fromIntegral n)
+          <> epoke
+    let poker =
+          PE.putWord32BE (fromIntegral . length $ fieldsPokers)
+          <> F.foldMap fieldPoker fieldsPokers
+    return (oid, Just poker)
+
+-- | Helper that construcst poke encoder for arrays with required buffer size
+pokeArray :: OidsMap -> EncoderArray -> Either CompositeName (Oid, Maybe PE.Encode)
+pokeArray oidsMap e = case e of
+  EncoderArray{..} -> do
     (oidElem, oidArr) <- resolveOids oidsMap encoderArrayElem
+    encoders <- fmap snd <$> traverse (pokePrimitive oidsMap) encoderArrayPayload
     let encodeArrayDim ArrayDimension{..} =
              PE.putWord32BE arrayElements
           <> PE.putWord32BE arrayDimStart
@@ -133,31 +135,22 @@ pokeEncoder oidsMap e = case e of
           <> PE.putWord32BE 1
           <> PE.putInt32BE (unOid oidElem)
           <> F.foldMap encodeArrayDim encoderArrayDims
-          <> encoderArrayPayload
+          <> payloadEncoder
+
+        payloadEncoder = flip F.foldMap encoders $ \a -> case a of
+          Nothing -> PE.putInt32BE (-1)
+          Just e  -> PE.putWord32BE (fromIntegral $ PE.getEncodeLen e) <> e
+
     return (oidArr, Just encoder)
-  Encoder'Array EncoderNullArray {..} -> do
+  EncoderNullArray {..} -> do
     (_, oidArr) <- resolveOids oidsMap encoderNullArrayElem
-    let poker =
-             PE.putWord32BE encoderNullArrayDims
-          <> PE.putWord32BE 0
-    return (oidArr, Just poker)
-  Encoder'Composite EncoderComposite {..} -> do
-    oid <- elookup encoderCompositeName $ oidsPlain oidsMap
-    case encoderCompositeFields of
-      Nothing -> return (oid, Nothing)
-      Just fields -> do
-        fieldsPokers <- traverse (pokeEncoder oidsMap) fields
-        let fieldPoker (eoid, Nothing) =
-                 PE.putInt32BE (unOid eoid)
-              <> PE.putInt32BE (-1)
-            fieldPoke (eoid, Just (epoke, n)) =
-                 PE.putInt32BE (unOid eoid)
-              <> PE.putWord32BE (fromIntegral n)
-              <> epoke
-        let poker =
-              PE.putWord32BE (fromIntegral . length $ fieldsPokers)
-              <> F.foldMap fieldPoker fieldsPokers
-        return (oid, Just poker)
+    return (oidArr, Nothing)
+
+-- | Helper that constructs poke encoder with needed buffer size
+pokeEncoder :: OidsMap -> Encoder -> Either CompositeName (Oid, Maybe PE.Encode)
+pokeEncoder oidsMap e = case e of
+  Encoder'Primitive pe -> pokePrimitive oidsMap pe
+  Encoder'Array ae -> pokeArray oidsMap ae
 
 -- | Lookup in composite name to OID map and return 'Left' with the composite name
 -- if cannot find the name.
@@ -180,8 +173,8 @@ class ToPg a where
 class ToPrimitive a where
   -- | Defines primitive OID and OID of array, or defines dynamicly resolved name
   primOids     :: Proxy a -> Either CompositeName (Oid, Oid)
-  -- | How to encode the primitive type
-  primEncoder  :: a -> Maybe PE.Encode
+  -- | How to encode the primitive type or composite encoder
+  primEncoder  :: a -> Maybe (Either [Encoder] PE.Encode)
 
 -- | Each primitive type has NULL encoder
 instance {-# OVERLAPPABLE #-} ToPrimitive a => ToPrimitive (Maybe a) where
@@ -192,16 +185,10 @@ instance {-# OVERLAPPABLE #-} ToPrimitive a => ToPrimitive (Maybe a) where
 
 -- | Embeds PostgreSQL primitive encoder into general Encoder
 primitive :: forall a . ToPrimitive a => a -> Encoder
-primitive v = Encoder'Primitive $ case primOids (Proxy :: Proxy a) of
-  Left name -> EncoderBase {
-      encoderBaseName = name
-    , encoderBasePoke = primEncoder v
-    }
-  Right (oid, oidArr) -> EncoderPrimitive {
-      encoderPrimOid    = oid
-    , encoderPrimArrOid = oidArr
-    , encoderPrimPoke   = primEncoder v
-    }
+primitive v = Encoder'Primitive EncoderPrimitive {
+    encoderPrimOids = primOids (Proxy :: Proxy a)
+  , encoderPrimPoke = primEncoder v
+  }
 {-# INLINE primitive #-}
 
 -- | Defines how to encode Haskell array to PostgreSQL multidimensional array
@@ -209,56 +196,186 @@ class ToArray (v :: * -> *) a where
   -- | Return either statically known OIDs of element and array or composite
   -- name of element type.
   arrayElement :: Proxy (v a) -> Either CompositeName (Oid, Oid)
-  -- | Statically known number of dimensions
-  arrayDimensionsCount :: Proxy (v a) -> Word32
   -- | Defines dimensions of resulting PostgreSQL array
   arrayDimensions :: v a -> Vector ArrayDimension
   -- | Encoder of single element
-  arrayEncoder :: Proxy v -> a -> Maybe PE.Encode
+  arrayEncoder :: Proxy v -> a -> EncoderPrimitive
 
-instance {-# OVERLAPPABLE #-} ToPrimitive a => ToArray [] a where
+instance {-# OVERLAPPABLE #-} (ToPrimitive a, Traversable v) => ToArray v a where
   arrayElement _ = primOids (Proxy :: Proxy a)
-  arrayDimensionsCount _ = 1
   arrayDimensions as = V.singleton $ ArrayDimension (fromIntegral $ length as) 1
-  arrayEncoder _ = primEncoder
+  arrayEncoder _ v = EncoderPrimitive {
+      encoderPrimOids = primOids (Proxy :: Proxy a)
+    , encoderPrimPoke = primEncoder v
+    }
   {-# INLINE arrayElement #-}
-  {-# INLINE arrayDimensionsCount #-}
   {-# INLINE arrayDimensions #-}
   {-# INLINE arrayEncoder #-}
 
--- TODO: Composite support as element
--- TODO: Multidimentional example
+-- | Helper that calculates dimensions for PostgreSQL array from Repa shape
+repaDims :: R.Shape sh => sh -> Vector ArrayDimension
+repaDims sh = V.fromList . flip fmap (R.listOfShape sh) $ \n -> ArrayDimension (fromIntegral n) 1
 
--- | Helper that collects payload for array elements
-arrayPayloadEncoder :: forall v a . (ToArray v a, Foldable v) => v a -> PE.Encode
-arrayPayloadEncoder = F.foldMap $ \a -> case arrayEncoder (Proxy :: Proxy v) a of
-  Nothing -> PE.putInt32BE (-1)
-  Just e  -> PE.putWord32BE (fromIntegral $ PE.getEncodeLen e) <> e
+-- | Multidimentional arrays are neatly expressed by Repa arrays
+instance {-# OVERLAPPABLE #-} (ToPrimitive a, R.Shape sh, R.Source r a) => ToArray (R.Array r sh) a where
+  arrayElement _ = primOids (Proxy :: Proxy a)
+  arrayDimensions = repaDims . R.extent
+  arrayEncoder _ v = EncoderPrimitive {
+      encoderPrimOids = primOids (Proxy :: Proxy a)
+    , encoderPrimPoke = primEncoder v
+    }
+  {-# INLINE arrayElement #-}
+  {-# INLINE arrayDimensions #-}
+  {-# INLINE arrayEncoder #-}
+
+-- | Peano naturals, TODO: use library one
+data Nat = Zero | Succ Nat
+
+-- | Helpers to calculate metrics of nested arrays
+class KnownNestedArray (n :: Nat) (v :: * -> *) a where
+  -- | Nested Array type
+  type MkNestedArray n v a :: *
+  -- | Calculate dimensions of nested array
+  nestedSize :: Proxy n -> Proxy v -> Proxy a -> MkNestedArray n v a -> Vector Int
+  -- | Make flat vector of nested vector
+  nestedFlat :: Proxy n -> Proxy v -> Proxy a -> MkNestedArray n v a -> Vector a
+
+instance Foldable v => KnownNestedArray Zero v a where
+  type MkNestedArray Zero v a = v a
+  nestedSize _ _ _ = V.singleton . F.length
+  nestedFlat _ _ _ = V.fromList . F.toList
+  {-# INLINE nestedSize #-}
+  {-# INLINE nestedFlat #-}
+
+instance {-# OVERLAPPABLE #-} (Functor v, Foldable v, Traversable v, KnownNestedArray n v a) => KnownNestedArray (Succ n) v a where
+  type MkNestedArray (Succ n) v a = v (MkNestedArray n v a)
+  nestedSize _ vprox aprox as = maximum (fmap (nestedSize (Proxy :: Proxy n) vprox aprox) as) `V.snoc` F.length as
+  nestedFlat _ vrpox aprox as = F.foldl' (V.++) V.empty $ fmap (nestedFlat (Proxy :: Proxy n) vrpox aprox) as
+  {-# INLINE nestedSize #-}
+  {-# INLINE nestedFlat #-}
+
+-- | Wrapper around nested array. A multidimensional PG array is generated from the newtype.
+newtype NestedArray (n :: Nat) (v :: * -> *) a = NestedArray { unNestedArray :: MkNestedArray n v a }
+
+-- | Generate dimension info from nested array
+nestedArrayDims :: forall n v a . KnownNestedArray n v a => NestedArray n v a -> Vector ArrayDimension
+nestedArrayDims arr = flip ArrayDimension 1 . fromIntegral <$> sizes
+  where
+    sizes = nestedSize (Proxy :: Proxy n) (Proxy :: Proxy v) (Proxy :: Proxy a) (unNestedArray arr)
+
+-- | Generate flat array from nested array
+nestedArrayVector :: forall n v a . KnownNestedArray n v a => NestedArray n v a -> Vector a
+nestedArrayVector = nestedFlat (Proxy :: Proxy n) (Proxy :: Proxy v) (Proxy :: Proxy a) . unNestedArray
+
+-- | Generate PG array from nested haskell collections
+instance (ToPrimitive a, KnownNestedArray n v a) => ToArray (NestedArray n v) a where
+  arrayElement _ = primOids (Proxy :: Proxy a)
+  arrayDimensions = nestedArrayDims
+  arrayEncoder _ v = EncoderPrimitive {
+      encoderPrimOids = primOids (Proxy :: Proxy a)
+    , encoderPrimPoke = primEncoder v
+    }
+  {-# INLINE arrayElement #-}
+  {-# INLINE arrayDimensions #-}
+  {-# INLINE arrayEncoder #-}
 
 -- | Embeds PostgreSQL array into general encoder
-array :: forall v a . (ToArray v a, Foldable v) => v a -> Encoder
+array :: forall v a . (ToArray v a, Traversable v) => v a -> Encoder
 array as = Encoder'Array EncoderArray {
     encoderArrayElem = arrayElement (Proxy :: Proxy (v a))
   , encoderArrayDims = arrayDimensions as
-  , encoderArrayPayload = arrayPayloadEncoder as
+  , encoderArrayPayload = V.fromList . F.toList $ arrayEncoder (Proxy :: Proxy v) <$> as
   }
 
 -- | Embeds PostgreSQL array into general encoder
 arrayNull :: forall v a . (ToArray v a) => Proxy (v a) -> Encoder
 arrayNull p = Encoder'Array EncoderNullArray {
     encoderNullArrayElem = arrayElement p
-  , encoderNullArrayDims = arrayDimensionsCount p
   }
 
 -- | Embeds PostgreSQL array into general encoder
-arrayMay :: forall v a . (ToArray v a, Foldable v) => Maybe (v a) -> Encoder
+arrayMay :: forall v a . (ToArray v a, Traversable v) => Maybe (v a) -> Encoder
 arrayMay Nothing = arrayNull (Proxy :: Proxy (v a))
 arrayMay (Just as) = array as
+
+-- | Embeds PostgreSQL array into general encoder
+arrayNested :: forall n v a . (ToArray v a, ToPrimitive a, KnownNestedArray n v a) => NestedArray n v a -> Encoder
+arrayNested as = Encoder'Array EncoderArray {
+    encoderArrayElem = arrayElement (Proxy :: Proxy (v a))
+  , encoderArrayDims = arrayDimensions as
+  , encoderArrayPayload = V.fromList . F.toList $ arrayEncoder (Proxy :: Proxy (NestedArray n v)) <$> nestedArrayVector as
+  }
+
+-- | Embeds PostgreSQL array into general encoder
+arrayNestedMay :: forall n v a . (ToArray v a, ToPrimitive a, KnownNestedArray n v a) => Maybe (NestedArray n v a) -> Encoder
+arrayNestedMay Nothing = arrayNull (Proxy :: Proxy (v a))
+arrayNestedMay (Just as) = arrayNested as
+
+-- | Convert repa array to PG array with parallelism. Monad is used to ensure that
+-- array is computed only once, see 'computeVectorP'.
+arrayRepaP :: forall r sh a m . (ToArray (R.Array r sh) a, R.Load r sh a, Monad m) => R.Array r sh a -> m Encoder
+arrayRepaP arr = do
+  payload <- R.computeVectorP arr
+  return $ Encoder'Array EncoderArray {
+      encoderArrayElem = arrayElement (Proxy :: Proxy (R.Array r sh a))
+    , encoderArrayDims = arrayDimensions arr
+    , encoderArrayPayload = fmap (arrayEncoder (Proxy :: Proxy (R.Array r sh))) . R.toVector $ payload
+    }
+
+-- | Convert nullable repa array to PG array with parallelism. Monad is used to ensure that
+-- array is computed only once, see 'computeVectorP'.
+arrayRepaPMay :: forall r sh a m . (ToArray (R.Array r sh) a, R.Load r sh a, Monad m) => Maybe (R.Array r sh a) -> m Encoder
+arrayRepaPMay Nothing = pure $ arrayNull (Proxy :: Proxy (R.Array r sh a))
+arrayRepaPMay (Just arr) = arrayRepaP arr
+
+-- | Convert repa array to PG array sequentionally.
+arrayRepaS :: forall r sh a . (ToArray (R.Array r sh) a, R.Load r sh a) => R.Array r sh a -> Encoder
+arrayRepaS arr = Encoder'Array EncoderArray {
+    encoderArrayElem = arrayElement (Proxy :: Proxy (R.Array r sh a))
+  , encoderArrayDims = arrayDimensions arr
+  , encoderArrayPayload = fmap (arrayEncoder (Proxy :: Proxy (R.Array r sh))) . R.toVector . R.computeVectorS $ arr
+  }
+
+-- | Convert nullable repa array to PG array with parallelism. Monad is used to ensure that
+-- array is computed only once, see 'computeVectorP'.
+arrayRepaSMay :: forall r sh a . (ToArray (R.Array r sh) a, R.Load r sh a) => Maybe (R.Array r sh a) -> Encoder
+arrayRepaSMay Nothing = arrayNull (Proxy :: Proxy (R.Array r sh a))
+arrayRepaSMay (Just arr) = arrayRepaS arr
+
+testVector :: Encoder
+testVector = array $ V.fromList [1, 2, 3, 4 :: Word16]
+
+vec2 :: NestedArray (Succ Zero) Vector Word16
+vec2 = NestedArray $ V.fromList [V.fromList [1, 2], V.fromList [3, 4]]
+
+vec3 :: NestedArray (Succ (Succ Zero)) Vector Word16
+vec3 = NestedArray $ V.fromList [
+    V.fromList [
+      V.fromList [1, 2]
+    , V.fromList [3, 4]
+    ]
+  , V.fromList [
+      V.fromList [5, 6]
+    , V.fromList [7, 8]
+    ]
+  ]
+
+testVector2 :: Encoder
+testVector2 = arrayNested vec2
+
+testVector3 :: Encoder
+testVector3 = arrayNested vec2
+
+testRepa1 :: Encoder
+testRepa1 = arrayRepaS $ R.fromFunction (R.ix2 2 2) $ const (0 :: Word16)
+
+testRepa2 :: Encoder
+testRepa2 = runIdentity . arrayRepaP $ R.fromFunction (R.ix2 2 2) $ const (0 :: Word16)
 
 -- | smallint
 instance ToPrimitive Word16 where
   primOids _  = Right (Oid 21, Oid 1005)
-  primEncoder = Just . PE.putWord16BE
+  primEncoder = Just . Right . PE.putWord16BE
   {-# INLINE primOids #-}
   {-# INLINE primEncoder #-}
 
