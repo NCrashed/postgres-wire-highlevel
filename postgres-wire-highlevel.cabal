@@ -34,6 +34,7 @@ library
     DataKinds
     DeriveTraversable
     FlexibleContexts
+    FlexibleInstances
     FunctionalDependencies
     GADTs
     GeneralizedNewtypeDeriving
