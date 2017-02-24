@@ -6,16 +6,15 @@ module Database.PostgreSQL.Encoder(
   , ToPg(..)
   , ToPrimitive(..)
   , ToArray(..)
-  , primitive
-  , array
-  , arrayNull
-  , arrayMay
+  , arrayRepaP
+  , arrayRepaPMay
   ) where
 
 import Control.Monad
 import Control.Monad.ST.Strict
 import Data.Functor.Identity
 import Data.Int
+import Data.Kind
 import Data.Map (Map)
 import Data.Maybe
 import Data.Monoid
@@ -193,6 +192,9 @@ primitive v = Encoder'Primitive EncoderPrimitive {
 
 -- | Defines how to encode Haskell array to PostgreSQL multidimensional array
 class ToArray (v :: * -> *) a where
+  -- | Type specific constraint on array
+  type ToPgArrayCond v a :: Constraint
+
   -- | Return either statically known OIDs of element and array or composite
   -- name of element type.
   arrayElement :: Proxy (v a) -> Either CompositeName (Oid, Oid)
@@ -201,7 +203,30 @@ class ToArray (v :: * -> *) a where
   -- | Encoder of single element
   arrayEncoder :: Proxy v -> a -> EncoderPrimitive
 
-instance {-# OVERLAPPABLE #-} (ToPrimitive a, Traversable v) => ToArray v a where
+  -- | Embeds PostgreSQL array into general encoder
+  array :: (ToArray v a, ToPgArrayCond v a) => v a -> Encoder
+
+  -- | Embeds NULL PostgreSQL array into general encoder
+  arrayNull :: (ToArray v a, ToPgArrayCond v a) => Proxy (v a) -> Encoder
+  arrayNull p = Encoder'Array EncoderNullArray {
+      encoderNullArrayElem = arrayElement p
+    }
+
+  -- | Embeds nullable PostgreSQL array into general encoder
+  arrayMay :: (ToArray v a, ToPgArrayCond v a) => Maybe (v a) -> Encoder
+  arrayMay Nothing = arrayNull (Proxy :: Proxy (v a))
+  arrayMay (Just as) = array as
+
+--------------------------------------------------------------------------------
+-- Flat array
+--------------------------------------------------------------------------------
+
+newtype FlatArray v a = FlatArray { unFlatArray :: v a }
+  deriving (Functor, Foldable, Traversable)
+
+instance {-# OVERLAPPABLE #-} (ToPrimitive a, Traversable v) => ToArray (FlatArray v) a where
+  type ToPgArrayCond (FlatArray v) a = (ToPrimitive a, Traversable v, Foldable v)
+
   arrayElement _ = primOids (Proxy :: Proxy a)
   arrayDimensions as = V.singleton $ ArrayDimension (fromIntegral $ length as) 1
   arrayEncoder _ v = EncoderPrimitive {
@@ -212,12 +237,24 @@ instance {-# OVERLAPPABLE #-} (ToPrimitive a, Traversable v) => ToArray v a wher
   {-# INLINE arrayDimensions #-}
   {-# INLINE arrayEncoder #-}
 
+  array as = Encoder'Array EncoderArray {
+      encoderArrayElem = arrayElement (Proxy :: Proxy (FlatArray v a))
+    , encoderArrayDims = arrayDimensions as
+    , encoderArrayPayload = V.fromList . F.toList $ arrayEncoder (Proxy :: Proxy (FlatArray v)) <$> as
+    }
+
+--------------------------------------------------------------------------------
+-- Repa array
+--------------------------------------------------------------------------------
+
 -- | Helper that calculates dimensions for PostgreSQL array from Repa shape
 repaDims :: R.Shape sh => sh -> Vector ArrayDimension
 repaDims sh = V.fromList . flip fmap (R.listOfShape sh) $ \n -> ArrayDimension (fromIntegral n) 1
 
 -- | Multidimentional arrays are neatly expressed by Repa arrays
 instance {-# OVERLAPPABLE #-} (ToPrimitive a, R.Shape sh, R.Source r a) => ToArray (R.Array r sh) a where
+  type ToPgArrayCond (R.Array r sh) a = (ToPrimitive a, R.Load r sh a)
+
   arrayElement _ = primOids (Proxy :: Proxy a)
   arrayDimensions = repaDims . R.extent
   arrayEncoder _ v = EncoderPrimitive {
@@ -227,6 +264,33 @@ instance {-# OVERLAPPABLE #-} (ToPrimitive a, R.Shape sh, R.Source r a) => ToArr
   {-# INLINE arrayElement #-}
   {-# INLINE arrayDimensions #-}
   {-# INLINE arrayEncoder #-}
+
+  array arr = Encoder'Array EncoderArray {
+      encoderArrayElem = arrayElement (Proxy :: Proxy (R.Array r sh a))
+    , encoderArrayDims = arrayDimensions arr
+    , encoderArrayPayload = fmap (arrayEncoder (Proxy :: Proxy (R.Array r sh))) . R.toVector . R.computeVectorS $ arr
+    }
+
+-- | Convert repa array to PG array with parallelism. Monad is used to ensure that
+-- array is computed only once, see 'computeVectorP'.
+arrayRepaP :: forall r sh a m . (ToArray (R.Array r sh) a, R.Load r sh a, Monad m) => R.Array r sh a -> m Encoder
+arrayRepaP arr = do
+  payload <- R.computeVectorP arr
+  return $ Encoder'Array EncoderArray {
+      encoderArrayElem = arrayElement (Proxy :: Proxy (R.Array r sh a))
+    , encoderArrayDims = arrayDimensions arr
+    , encoderArrayPayload = fmap (arrayEncoder (Proxy :: Proxy (R.Array r sh))) . R.toVector $ payload
+    }
+
+-- | Convert nullable repa array to PG array with parallelism. Monad is used to ensure that
+-- array is computed only once, see 'computeVectorP'.
+arrayRepaPMay :: forall r sh a m . (ToArray (R.Array r sh) a, R.Load r sh a, Monad m, ToPgArrayCond (R.Array r sh) a) => Maybe (R.Array r sh a) -> m Encoder
+arrayRepaPMay Nothing = pure $ arrayNull (Proxy :: Proxy (R.Array r sh a))
+arrayRepaPMay (Just arr) = arrayRepaP arr
+
+--------------------------------------------------------------------------------
+-- Nested Array
+--------------------------------------------------------------------------------
 
 -- | Peano naturals, TODO: use library one
 data Nat = Zero | Succ Nat
@@ -269,6 +333,8 @@ nestedArrayVector = nestedFlat (Proxy :: Proxy n) (Proxy :: Proxy v) (Proxy :: P
 
 -- | Generate PG array from nested haskell collections
 instance (ToPrimitive a, KnownNestedArray n v a) => ToArray (NestedArray n v) a where
+  type ToPgArrayCond (NestedArray n v) a = (ToPrimitive a, KnownNestedArray n v a, Traversable v)
+
   arrayElement _ = primOids (Proxy :: Proxy a)
   arrayDimensions = nestedArrayDims
   arrayEncoder _ v = EncoderPrimitive {
@@ -279,71 +345,25 @@ instance (ToPrimitive a, KnownNestedArray n v a) => ToArray (NestedArray n v) a 
   {-# INLINE arrayDimensions #-}
   {-# INLINE arrayEncoder #-}
 
--- | Embeds PostgreSQL array into general encoder
-array :: forall v a . (ToArray v a, Traversable v) => v a -> Encoder
-array as = Encoder'Array EncoderArray {
-    encoderArrayElem = arrayElement (Proxy :: Proxy (v a))
-  , encoderArrayDims = arrayDimensions as
-  , encoderArrayPayload = V.fromList . F.toList $ arrayEncoder (Proxy :: Proxy v) <$> as
-  }
-
--- | Embeds PostgreSQL array into general encoder
-arrayNull :: forall v a . (ToArray v a) => Proxy (v a) -> Encoder
-arrayNull p = Encoder'Array EncoderNullArray {
-    encoderNullArrayElem = arrayElement p
-  }
-
--- | Embeds PostgreSQL array into general encoder
-arrayMay :: forall v a . (ToArray v a, Traversable v) => Maybe (v a) -> Encoder
-arrayMay Nothing = arrayNull (Proxy :: Proxy (v a))
-arrayMay (Just as) = array as
-
--- | Embeds PostgreSQL array into general encoder
-arrayNested :: forall n v a . (ToArray v a, ToPrimitive a, KnownNestedArray n v a) => NestedArray n v a -> Encoder
-arrayNested as = Encoder'Array EncoderArray {
-    encoderArrayElem = arrayElement (Proxy :: Proxy (v a))
-  , encoderArrayDims = arrayDimensions as
-  , encoderArrayPayload = V.fromList . F.toList $ arrayEncoder (Proxy :: Proxy (NestedArray n v)) <$> nestedArrayVector as
-  }
-
--- | Embeds PostgreSQL array into general encoder
-arrayNestedMay :: forall n v a . (ToArray v a, ToPrimitive a, KnownNestedArray n v a) => Maybe (NestedArray n v a) -> Encoder
-arrayNestedMay Nothing = arrayNull (Proxy :: Proxy (v a))
-arrayNestedMay (Just as) = arrayNested as
-
--- | Convert repa array to PG array with parallelism. Monad is used to ensure that
--- array is computed only once, see 'computeVectorP'.
-arrayRepaP :: forall r sh a m . (ToArray (R.Array r sh) a, R.Load r sh a, Monad m) => R.Array r sh a -> m Encoder
-arrayRepaP arr = do
-  payload <- R.computeVectorP arr
-  return $ Encoder'Array EncoderArray {
-      encoderArrayElem = arrayElement (Proxy :: Proxy (R.Array r sh a))
-    , encoderArrayDims = arrayDimensions arr
-    , encoderArrayPayload = fmap (arrayEncoder (Proxy :: Proxy (R.Array r sh))) . R.toVector $ payload
+  -- | Embeds PostgreSQL array into general encoder
+  array as = Encoder'Array EncoderArray {
+      encoderArrayElem = arrayElement (Proxy :: Proxy (NestedArray n v a))
+    , encoderArrayDims = arrayDimensions as
+    , encoderArrayPayload = V.fromList . F.toList $ arrayEncoder (Proxy :: Proxy (NestedArray n v)) <$> nestedArrayVector as
     }
 
--- | Convert nullable repa array to PG array with parallelism. Monad is used to ensure that
--- array is computed only once, see 'computeVectorP'.
-arrayRepaPMay :: forall r sh a m . (ToArray (R.Array r sh) a, R.Load r sh a, Monad m) => Maybe (R.Array r sh a) -> m Encoder
-arrayRepaPMay Nothing = pure $ arrayNull (Proxy :: Proxy (R.Array r sh a))
-arrayRepaPMay (Just arr) = arrayRepaP arr
+--------------------------------------------------------------------------------
+-- Primitives
+--------------------------------------------------------------------------------
 
--- | Convert repa array to PG array sequentionally.
-arrayRepaS :: forall r sh a . (ToArray (R.Array r sh) a, R.Load r sh a) => R.Array r sh a -> Encoder
-arrayRepaS arr = Encoder'Array EncoderArray {
-    encoderArrayElem = arrayElement (Proxy :: Proxy (R.Array r sh a))
-  , encoderArrayDims = arrayDimensions arr
-  , encoderArrayPayload = fmap (arrayEncoder (Proxy :: Proxy (R.Array r sh))) . R.toVector . R.computeVectorS $ arr
-  }
+testNullArray1 :: Encoder
+testNullArray1 = arrayNull (Proxy :: Proxy (FlatArray Vector Word16))
 
--- | Convert nullable repa array to PG array with parallelism. Monad is used to ensure that
--- array is computed only once, see 'computeVectorP'.
-arrayRepaSMay :: forall r sh a . (ToArray (R.Array r sh) a, R.Load r sh a) => Maybe (R.Array r sh a) -> Encoder
-arrayRepaSMay Nothing = arrayNull (Proxy :: Proxy (R.Array r sh a))
-arrayRepaSMay (Just arr) = arrayRepaS arr
+testNullArray2 :: Encoder
+testNullArray2 = arrayNull (Proxy :: Proxy (NestedArray (Succ Zero) Vector Word16))
 
 testVector :: Encoder
-testVector = array $ V.fromList [1, 2, 3, 4 :: Word16]
+testVector = array $ FlatArray $ V.fromList [1, 2, 3, 4 :: Word16]
 
 vec2 :: NestedArray (Succ Zero) Vector Word16
 vec2 = NestedArray $ V.fromList [V.fromList [1, 2], V.fromList [3, 4]]
@@ -361,13 +381,13 @@ vec3 = NestedArray $ V.fromList [
   ]
 
 testVector2 :: Encoder
-testVector2 = arrayNested vec2
+testVector2 = array vec2
 
 testVector3 :: Encoder
-testVector3 = arrayNested vec2
+testVector3 = array vec2
 
 testRepa1 :: Encoder
-testRepa1 = arrayRepaS $ R.fromFunction (R.ix2 2 2) $ const (0 :: Word16)
+testRepa1 = array $ R.fromFunction (R.ix2 2 2) $ const (0 :: Word16)
 
 testRepa2 :: Encoder
 testRepa2 = runIdentity . arrayRepaP $ R.fromFunction (R.ix2 2 2) $ const (0 :: Word16)

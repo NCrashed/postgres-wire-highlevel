@@ -32,6 +32,7 @@ library
   default-extensions:
     BangPatterns
     DataKinds
+    DeriveTraversable
     FlexibleContexts
     FunctionalDependencies
     GADTs
