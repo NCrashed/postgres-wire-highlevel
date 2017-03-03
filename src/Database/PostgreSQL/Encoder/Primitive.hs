@@ -18,6 +18,36 @@ import qualified Database.PostgreSQL.Protocol.Store.Encode as PE
 import Database.PostgreSQL.Encoder.Class
 import Database.PostgreSQL.Encoder.Array
 
+data TestEnum = Option1 | Option2 | Option3
+  deriving (Read, Show, Eq, Ord, Enum, Bounded)
+
+instance ToPrimitive TestEnum where
+  primOids _ = dynamicOid "TestEnum"
+  primEncoder = enum
+
+data TestData = TestData {
+  field1 :: Word16
+, field2 :: Word32
+, field3 :: [Word16]
+, field4 :: Vector Word32
+, field5 :: TestEnum
+, field6 :: Vector (Vector TestEnum)
+, field7 :: Maybe TestData
+}
+
+instance ToPrimitive TestData where
+  primOids _ = dynamicOid "TestData"
+  primEncoder TestData{..} = composite [
+      toPg field1
+    , toPg field2
+    , toPg field3
+    , toPg field4
+    , toPg field5
+    , array (NestedArray field6 :: NestedArray ('Succ 'Zero) Vector TestEnum)
+    , toPg field7
+    ]
+
+
 testNullArray1 :: Encoder
 testNullArray1 = arrayNull (Proxy :: Proxy (FlatArray Vector Word16))
 
@@ -25,7 +55,7 @@ testNullArray2 :: Encoder
 testNullArray2 = arrayNull (Proxy :: Proxy (NestedArray ('Succ 'Zero) Vector Word16))
 
 testVector :: Encoder
-testVector = array $ FlatArray $ V.fromList [1, 2, 3, 4 :: Word16]
+testVector = toPg $ V.fromList [1, 2, 3, 4 :: Word16]
 
 vec2 :: NestedArray ('Succ 'Zero) Vector Word16
 vec2 = NestedArray $ V.fromList [V.fromList [1, 2], V.fromList [3, 4]]
@@ -56,16 +86,17 @@ testRepa2 = runIdentity . arrayRepaP $ R.fromFunction (R.ix2 2 2) $ const (0 :: 
 
 -- | smallint
 instance ToPrimitive Word16 where
-  primOids _  = Right (Oid 21, Oid 1005)
-  primEncoder = Just . Right . PE.putWord16BE
+  primOids _  = staticOid (Oid 21) (Oid 1005)
+  primEncoder = prim . PE.putWord16BE
   {-# INLINE primOids #-}
   {-# INLINE primEncoder #-}
 
-
 -- | integer
-instance ToPg Word32 where
-  toPg = undefined
-  {-# INLINE toPg #-}
+instance ToPrimitive Word32 where
+  primOids _  = staticOid (Oid 23) (Oid 1007)
+  primEncoder = prim . PE.putWord32BE
+  {-# INLINE primOids #-}
+  {-# INLINE primEncoder #-}
 
 -- | bigint
 instance ToPg Word64 where

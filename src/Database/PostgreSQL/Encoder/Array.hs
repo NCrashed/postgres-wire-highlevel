@@ -150,3 +150,15 @@ instance (ToPrimitive a, KnownNestedArray n v a) => ToArray (NestedArray n v) a 
     , encoderArrayDims = arrayDimensions as
     , encoderArrayPayload = V.fromList . F.toList $ arrayEncoder (Proxy :: Proxy (NestedArray n v)) <$> nestedArrayVector as
     }
+
+instance (ToArray (FlatArray Vector) a, ToPrimitive a) => ToPg (Vector a) where
+  toPg = array . FlatArray
+
+instance (ToArray (FlatArray Vector) a, ToPrimitive a) => ToPg (Maybe (Vector a)) where
+  toPg = arrayMay . fmap FlatArray
+
+instance (ToArray (FlatArray []) a, ToPrimitive a) => ToPg ([] a) where
+  toPg = array . FlatArray
+
+instance (ToArray (FlatArray []) a, ToPrimitive a) => ToPg (Maybe [a]) where
+  toPg = arrayMay . fmap FlatArray

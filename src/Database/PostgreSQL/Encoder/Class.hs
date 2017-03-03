@@ -4,6 +4,11 @@ module Database.PostgreSQL.Encoder.Class(
   , EncoderArray(..)
   , ArrayDimension(..)
   , OidsMap(..)
+  , staticOid
+  , dynamicOid
+  , composite
+  , enum
+  , prim
   , runEncoder
   , ToPg(..)
   , ToPrimitive(..)
@@ -23,6 +28,7 @@ import qualified Data.ByteString as BS
 import qualified Data.Foldable as F
 import qualified Data.Map.Strict as M
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as T
 import qualified Data.Vector as V
 import qualified Database.PostgreSQL.Protocol.Store.Encode as PE
 
@@ -76,6 +82,29 @@ data OidsMap = OidsMap {
   -- | Map that stores oids for array types for given name of composite type
 , oidsArray :: Map CompositeName Oid
 }
+
+-- | Helper to state that OID must by queried at runtime by name
+dynamicOid :: CompositeName -> Either CompositeName (Oid, Oid)
+dynamicOid = Left
+
+-- | Helper to state that OID is known statically
+staticOid :: Oid -> Oid -> Either CompositeName (Oid, Oid)
+staticOid oid oidArr = Right (oid, oidArr)
+
+-- | Helper to define custom composite types
+composite :: [Encoder] -> Maybe (Either [Encoder] PE.Encode)
+composite = Just . Left
+
+-- | Helper to define primitive encoder
+prim :: PE.Encode -> Maybe (Either [Encoder] PE.Encode)
+prim = Just . Right
+
+-- | Helper to define custom enums
+enum :: Show a => a -> Maybe (Either [Encoder] PE.Encode)
+enum a = prim e
+  where
+    ae = PE.putPgString . T.encodeUtf8 . T.pack . show $ a
+    e = PE.putWord32BE (fromIntegral . PE.getEncodeLen $ ae) <> ae
 
 -- | Execute encoder action with given mapping of custom composite types.
 --
@@ -179,6 +208,10 @@ primitive v = Encoder'Primitive EncoderPrimitive {
   , encoderPrimPoke = primEncoder v
   }
 {-# INLINE primitive #-}
+
+-- | Default instance for 'ToPg' is based on primitive type
+instance {-# OVERLAPPABLE #-} ToPrimitive a => ToPg a where
+  toPg = primitive
 
 -- | Defines how to encode Haskell array to PostgreSQL multidimensional array
 class ToArray (v :: * -> *) a where
