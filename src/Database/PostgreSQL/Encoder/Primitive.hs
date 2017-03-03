@@ -21,9 +21,9 @@ import Database.PostgreSQL.Encoder.Array
 data TestEnum = Option1 | Option2 | Option3
   deriving (Read, Show, Eq, Ord, Enum, Bounded)
 
-instance ToPrimitive TestEnum where
-  primOids _ = dynamicOid "TestEnum"
-  primEncoder = enum
+instance ToPg TestEnum where
+  toPg = enum $ getOid (Proxy :: Proxy TestEnum)
+  getOid _ = OidComposite "TestEnum"
 
 data TestData = TestData {
   field1 :: Word16
@@ -35,33 +35,32 @@ data TestData = TestData {
 , field7 :: Maybe TestData
 }
 
-instance ToPrimitive TestData where
-  primOids _ = dynamicOid "TestData"
-  primEncoder TestData{..} = composite [
+instance ToPg TestData where
+  toPg TestData{..} = composite (getOid (Proxy :: Proxy TestData)) [
       toPg field1
     , toPg field2
     , toPg field3
     , toPg field4
     , toPg field5
-    , array (NestedArray field6 :: NestedArray ('Succ 'Zero) Vector TestEnum)
+    , toPg field6
     , toPg field7
     ]
-
+  getOid _ = OidComposite "TestData"
 
 testNullArray1 :: Encoder
-testNullArray1 = arrayNull (Proxy :: Proxy (FlatArray Vector Word16))
+testNullArray1 = nullEncoder $ getOid (Proxy :: Proxy (Vector Word16))
 
 testNullArray2 :: Encoder
-testNullArray2 = arrayNull (Proxy :: Proxy (NestedArray ('Succ 'Zero) Vector Word16))
+testNullArray2 = nullEncoder $ getOid (Proxy :: Proxy (Vector (Vector Word16)))
 
 testVector :: Encoder
 testVector = toPg $ V.fromList [1, 2, 3, 4 :: Word16]
 
-vec2 :: NestedArray ('Succ 'Zero) Vector Word16
-vec2 = NestedArray $ V.fromList [V.fromList [1, 2], V.fromList [3, 4]]
+vec2 :: Vector (Vector Word16)
+vec2 = V.fromList [V.fromList [1, 2], V.fromList [3, 4]]
 
-vec3 :: NestedArray ('Succ ('Succ 'Zero)) Vector Word16
-vec3 = NestedArray $ V.fromList [
+vec3 :: Vector (Vector (Vector Word16))
+vec3 = V.fromList [
     V.fromList [
       V.fromList [1, 2]
     , V.fromList [3, 4]
@@ -73,35 +72,37 @@ vec3 = NestedArray $ V.fromList [
   ]
 
 testVector2 :: Encoder
-testVector2 = array vec2
+testVector2 = toPg vec2
 
 testVector3 :: Encoder
-testVector3 = array vec2
+testVector3 = toPg vec2
 
 testRepa1 :: Encoder
-testRepa1 = array $ R.fromFunction (R.ix2 2 2) $ const (0 :: Word16)
+testRepa1 = toPg $ R.fromFunction (R.ix2 2 2) $ const (0 :: Word16)
 
 testRepa2 :: Encoder
 testRepa2 = runIdentity . arrayRepaP $ R.fromFunction (R.ix2 2 2) $ const (0 :: Word16)
 
 -- | smallint
-instance ToPrimitive Word16 where
-  primOids _  = staticOid (Oid 21) (Oid 1005)
-  primEncoder = prim . PE.putWord16BE
-  {-# INLINE primOids #-}
-  {-# INLINE primEncoder #-}
+instance ToPg Word16 where
+  getOid _  = OidKnown (Oid 21) (Oid 1005)
+  toPg = primitive (getOid (Proxy :: Proxy Word16)) . PE.putWord16BE
+  {-# INLINE getOid #-}
+  {-# INLINE toPg #-}
 
 -- | integer
-instance ToPrimitive Word32 where
-  primOids _  = staticOid (Oid 23) (Oid 1007)
-  primEncoder = prim . PE.putWord32BE
-  {-# INLINE primOids #-}
-  {-# INLINE primEncoder #-}
+instance ToPg Word32 where
+  getOid _  = OidKnown (Oid 23) (Oid 1007)
+  toPg = primitive (getOid (Proxy :: Proxy Word32)) . PE.putWord32BE
+  {-# INLINE getOid #-}
+  {-# INLINE toPg #-}
 
 -- | bigint
-instance ToPg Word64 where
-  toPg = undefined
-  {-# INLINE toPg #-}
+-- instance ToPg Word64 where
+--   getOid _  = OidKnown (Oid 20) (Oid 1016)
+--   toPg = primitive (getOid (Proxy :: Proxy Word64)) . PE.putWord64BE
+--   {-# INLINE getOid #-}
+--   {-# INLINE toPg #-}
 
 -- | real
 instance ToPg Float where
@@ -114,9 +115,9 @@ instance ToPg Double where
   {-# INLINE toPg #-}
 
 -- | text, varchar
-instance ToPg String where
-  toPg = undefined
-  {-# INLINE toPg #-}
+-- instance ToPg String where
+--   toPg = undefined
+--   {-# INLINE toPg #-}
 
 -- | text, varchar
 instance ToPg T.Text where
